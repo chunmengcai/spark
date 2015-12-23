@@ -17,6 +17,8 @@
 
 package org.apache.spark.sql.execution.datasources
 
+import scala.collection.mutable.ArrayBuffer
+
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.rdd.{MapPartitionsRDD, RDD, UnionRDD}
 import org.apache.spark.sql.catalyst.CatalystTypeConverters.convertToScala
@@ -25,6 +27,7 @@ import org.apache.spark.sql.catalyst.planning.PhysicalOperation
 import org.apache.spark.sql.catalyst.plans.logical
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow, expressions}
+import org.apache.spark.sql.execution.PhysicalRDD.{INPUT_PATHS, PUSHED_FILTERS}
 import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types.{StringType, StructType}
@@ -315,6 +318,21 @@ private[sql] object DataSourceStrategy extends Strategy with Logging {
     // `Filter`s or cannot be handled by `relation`.
     val filterCondition = unhandledPredicates.reduceLeftOption(expressions.And)
 
+    val metadata: Map[String, String] = {
+      val pairs = ArrayBuffer.empty[(String, String)]
+
+      if (pushedFilters.nonEmpty) {
+        pairs += (PUSHED_FILTERS -> pushedFilters.mkString("[", ", ", "]"))
+      }
+
+      relation.relation match {
+        case r: HadoopFsRelation => pairs += INPUT_PATHS -> r.paths.mkString(", ")
+        case _ =>
+      }
+
+      pairs.toMap
+    }
+
     if (projects.map(_.toAttribute) == projects &&
         projectSet.size == projects.size &&
         filterSet.subsetOf(projectSet)) {
@@ -332,7 +350,7 @@ private[sql] object DataSourceStrategy extends Strategy with Logging {
       val scan = execution.PhysicalRDD.createFromDataSource(
         projects.map(_.toAttribute),
         scanBuilder(requestedColumns, candidatePredicates, pushedFilters),
-        relation.relation)
+        relation.relation, metadata)
       filterCondition.map(execution.Filter(_, scan)).getOrElse(scan)
     } else {
       // Don't request columns that are only referenced by pushed filters.
@@ -342,8 +360,9 @@ private[sql] object DataSourceStrategy extends Strategy with Logging {
       val scan = execution.PhysicalRDD.createFromDataSource(
         requestedColumns,
         scanBuilder(requestedColumns, candidatePredicates, pushedFilters),
-        relation.relation)
-      execution.Project(projects, filterCondition.map(execution.Filter(_, scan)).getOrElse(scan))
+        relation.relation, metadata)
+      execution.Project(
+        projects, filterCondition.map(execution.Filter(_, scan)).getOrElse(scan))
     }
   }
 
@@ -453,8 +472,8 @@ private[sql] object DataSourceStrategy extends Strategy with Logging {
    *
    * @return A pair of `Seq[Expression]` and `Seq[Filter]`. The first element contains all Catalyst
    *         predicate [[Expression]]s that are either not convertible or cannot be handled by
-   *         `relation`. The second element contains all converted data source [[Filter]]s that can
-   *        be handled by `relation`.
+   *         `relation`. The second element contains all converted data source [[Filter]]s that
+   *         will be pushed down to the data source.
    */
   protected[sql] def selectFilters(
     relation: BaseRelation,
@@ -476,7 +495,9 @@ private[sql] object DataSourceStrategy extends Strategy with Logging {
     // Catalyst predicate expressions that cannot be translated to data source filters.
     val unrecognizedPredicates = predicates.filterNot(translatedMap.contains)
 
-    // Data source filters that cannot be handled by `relation`
+    // Data source filters that cannot be handled by `relation`. The semantic of a unhandled filter
+    // at here is that a data source may not be able to apply this filter to every row
+    // of the underlying dataset.
     val unhandledFilters = relation.unhandledFilters(translatedMap.values.toArray).toSet
 
     val (unhandled, handled) = translated.partition {
@@ -491,6 +512,11 @@ private[sql] object DataSourceStrategy extends Strategy with Logging {
     // Translated data source filters that can be handled by `relation`
     val (_, handledFilters) = handled.unzip
 
-    (unrecognizedPredicates ++ unhandledPredicates, handledFilters)
+    // translated contains all filters that have been converted to the public Filter interface.
+    // We should always push them to the data source no matter whether the data source can apply
+    // a filter to every row or not.
+    val (_, translatedFilters) = translated.unzip
+
+    (unrecognizedPredicates ++ unhandledPredicates, translatedFilters)
   }
 }
